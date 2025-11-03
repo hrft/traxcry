@@ -3,6 +3,99 @@ import ccxt
 import pandas as pd
 from dotenv import load_dotenv
 import os
+import requests
+
+def get_coingecko_data(symbols):
+    """
+    دریافت مارکت کپ و Circulating Supply از CoinGecko برای لیست توکن‌ها.
+    :param symbols: لیستی از نمادهای توکن (مثل ['btc', 'eth', ...])
+    :return: دیکشنری شامل داده‌های مورد نیاز.
+    """
+    
+    # 1. آماده‌سازی لیست آیدی‌های CoinGecko (نیاز به تطبیق نام‌ها)
+    # توجه: CCXT از جفت ارز (BTC/USDT) استفاده می‌کند، اما CG از آیدی توکن (bitcoin) استفاده می‌کند.
+    # برای ساده‌سازی، فرض می‌کنیم CCXT Symbols را به آیدی‌های CG تبدیل می‌کنیم.
+    
+    # برای شروع، فقط 250 ارز برتر را دریافت می‌کنیم:
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        'vs_currency': 'usd',
+        'per_page': 250,
+        'page': 1,
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status() # بررسی خطاهای HTTP
+        data = response.json()
+        
+        # 2. فیلتر داده‌ها برای استخراج مارکت کپ و نماد
+        market_data = {}
+        for coin in data:
+            # CoinGecko نماد را lowercase می‌دهد
+            symbol = coin.get('symbol', '').upper()
+            market_data[symbol] = {
+                'market_cap': coin.get('market_cap'),
+                'total_volume': coin.get('total_volume')
+            }
+        
+        return market_data
+        
+    except requests.RequestException as e:
+        print(f"❌ خطا در اتصال به CoinGecko: {e}")
+        return {}
+
+# data_collector.py (تابع fetch_and_filter_markets را به صورت زیر جایگزین کنید)
+
+# ... (بقیه توابع، شامل get_coingecko_data و initialize_exchange، بدون تغییر باقی می‌مانند) ...
+
+
+def fetch_and_filter_markets(exchange):
+    """
+    1. دریافت مارکت‌کپ از CoinGecko.
+    2. اعمال فیلتر ساختاری TraxCry.
+    3. بررسی وجود جفت ارز در CoinEx با استفاده از fetch_markets().
+    """
+    
+    # 1. دریافت داده‌های CoinGecko
+    coingecko_data = get_coingecko_data(None)
+    if not coingecko_data:
+        return []
+
+    # 2. دریافت لیست مارکت‌های صرافی (تست اصلی ارتباط CoinEx)
+    try:
+        # این فراخوانی از یک Public Endpoint استفاده می‌کند که نباید نیاز به API Key داشته باشد.
+        markets = exchange.fetch_markets()
+        available_symbols = set([m['symbol'] for m in markets]) # لیست جفت‌های موجود در صرافی (مثل 'BTC/USDT')
+    except Exception as e:
+        # اگر در اینجا خطا بدهد، مشکل همان اتصال پروکسی/احراز هویت عمومی است.
+        print(f"❌ خطا در دریافت لیست مارکت‌های CoinEx. لطفاً پروکسی یا API KEY را بررسی کنید. خطا: {e}")
+        return []
+
+
+    # 3. اعمال فیلترهای ساختاری TraxCry
+    # تنظیمات از متغیرهای global در بالای فایل data_collector.py گرفته می‌شود.
+    # فرض می‌کنیم MAX_MARKET_CAP و MIN_DAILY_VOLUME هنوز تعریف شده‌اند.
+    
+    # 4. فیلتر کردن نهایی
+    filtered_symbols = []
+    
+    for symbol_base, data in coingecko_data.items():
+        mc = data.get('market_cap', 0)
+        vol = data.get('total_volume', 0)
+        
+        # تبدیل نماد به فرمت CCXT
+        ccxt_symbol = f"{symbol_base}/USDT" 
+        
+        # اعمال فیلتر: مارکت کپ < $500M و حجم > $1M
+        if (mc is not None and mc <= MAX_MARKET_CAP) and \
+           (vol is not None and vol >= MIN_DAILY_VOLUME):
+            
+            # بررسی نهایی: آیا این جفت ارز در CoinEx موجود است؟
+            if ccxt_symbol in available_symbols:
+                filtered_symbols.append(ccxt_symbol)
+            
+    return filtered_symbols
 
 # بارگذاری متغیرهای محیطی از فایل .env
 load_dotenv()
@@ -33,43 +126,4 @@ def initialize_exchange():
     })
     return exchange
 
-def fetch_and_filter_markets(exchange):
-    """
-    دریافت لیست بازارها و اعمال فیلترهای مارکت‌کپ و حجم.
-    (توجه: API های CCXT مارکت‌کپ را مستقیم نمی‌دهند؛ باید تخمین بزنیم.)
-    """
-    try:
-        # 1. دریافت همه تیکرها (برای حجم 24h و قیمت)
-        tickers = exchange.fetch_tickers()
-        
-        # 2. فیلتر کردن جفت‌های USDT و اعمال فیلتر ساختاری
-        filtered_symbols = []
-        
-        for symbol, ticker in tickers.items():
-            # فیلتر کردن جفت‌های USDT و توکن‌های ETF/اهرمی
-            if symbol.endswith('/USDT') and '3L' not in symbol and '3S' not in symbol:
-                
-                base_currency = symbol.split('/')[0]
-                
-                # بررسی حجم
-                volume_24h = ticker.get('quoteVolume', 0) 
-                if volume_24h >= MIN_DAILY_VOLUME:
-                    
-                    # در CCXT، Market Cap را باید از منبع دیگری (مثل CoinGecko) دریافت کرد، 
-                    # اما برای MVP اولیه، ما روی حجم و قیمت تمرکز می‌کنیم.
-                    # فرض می‌کنیم ارزهایی که volume پایینی دارند احتمالاً MC پایینی هم دارند.
-                    
-                    # در این مرحله، ما فقط فیلتر حجم را اعمال می‌کنیم
-                    filtered_symbols.append(symbol)
-                    
-        return filtered_symbols
-        
-    except Exception as e:
-        print(f"خطا در دریافت و فیلتر بازارها: {e}")
-        return []
 
-# # نحوه استفاده (برای تست):
-# exchange = initialize_exchange()
-# if exchange:
-#     initial_watchlist = fetch_and_filter_markets(exchange)
-#     print(f"واچ‌لیست اولیه (بر اساس حجم): {initial_watchlist[:10]}")
